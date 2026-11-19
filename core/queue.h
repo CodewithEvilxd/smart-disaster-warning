@@ -2,6 +2,7 @@
 #define QUEUE_H
 
 #include <pthread.h>
+#include <semaphore.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -24,11 +25,14 @@ typedef struct {
     size_t size;
     size_t capacity;
     pthread_mutex_t mutex;
+    sem_t *empty_slots;
+    sem_t *full_slots;
 } PriorityQueue;
 
-int queue_init(PriorityQueue *queue, size_t capacity);
+int queue_init(PriorityQueue *queue, size_t capacity, sem_t *empty_slots, sem_t *full_slots);
 void queue_destroy(PriorityQueue *queue);
-int queue_push(PriorityQueue *queue, Alert alert);
+/* Returns 1 inserted, 2 inserted after replacement, 0 dropped, or -1 on error. */
+int queue_push(PriorityQueue *queue, Alert alert, Alert *dropped);
 int queue_pop(PriorityQueue *queue, Alert *alert);
 size_t queue_size(PriorityQueue *queue);
 

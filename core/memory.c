@@ -1,8 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 #include "memory.h"
+#include "event_log.h"
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -67,20 +69,31 @@ static void emit_page_fault(long long timestamp, int sensor_id, uint64_t page,
                             PageAlgorithm algorithm, const uint64_t *frame_snapshot,
                             size_t frame_count, uint64_t victim)
 {
-    flockfile(stdout);
-    printf("{\"t\":%lld,\"ev\":\"page_fault\",\"sensor\":%d,\"page\":%" PRIu64 ",\"algo\":\"%s\",\"frames\":[",
-           timestamp, sensor_id, page, page_algorithm_name(algorithm));
+    char line[PIPE_BUF];
+    size_t used = (size_t)snprintf(line, sizeof(line),
+        "{\"t\":%lld,\"ev\":\"page_fault\",\"sensor\":%d,\"page\":%" PRIu64 ",\"algo\":\"%s\",\"frames\":[",
+        timestamp, sensor_id, page, page_algorithm_name(algorithm));
     for (size_t i = 0; i < frame_count; i++) {
-        if (i > 0) putchar(',');
-        if (frame_snapshot[i] == EMPTY_PAGE) fputs("null", stdout);
-        else printf("%" PRIu64, frame_snapshot[i]);
+        if (i > 0 && used + 1 < sizeof(line)) line[used++] = ',';
+        int amount;
+        if (frame_snapshot[i] == EMPTY_PAGE)
+            amount = snprintf(line + used, sizeof(line) - used, "null");
+        else
+            amount = snprintf(line + used, sizeof(line) - used, "%" PRIu64, frame_snapshot[i]);
+        if (amount < 0 || (size_t)amount >= sizeof(line) - used) return;
+        used += (size_t)amount;
     }
-    fputs("],\"victim\":", stdout);
-    if (victim == EMPTY_PAGE) fputs("null", stdout);
-    else printf("%" PRIu64, victim);
-    fputs("}\n", stdout);
-    fflush(stdout);
-    funlockfile(stdout);
+    int amount = snprintf(line + used, sizeof(line) - used, "],\"victim\":");
+    if (amount < 0 || (size_t)amount >= sizeof(line) - used) return;
+    used += (size_t)amount;
+    if (victim == EMPTY_PAGE)
+        amount = snprintf(line + used, sizeof(line) - used, "null}");
+    else
+        amount = snprintf(line + used, sizeof(line) - used, "%" PRIu64 "}", victim);
+    if (amount < 0 || (size_t)amount >= sizeof(line) - used) return;
+    used += (size_t)amount;
+    line[used] = '\0';
+    (void)event_log_emit("%s", line);
 }
 
 int memory_init(MemoryManager *memory, size_t sensor_count, size_t buffer_size,
@@ -150,9 +163,11 @@ void memory_destroy(MemoryManager *memory)
 }
 
 /* OS concept: the bounded per-sensor circular buffer overwrites its oldest reading. */
-/* Lock order: queue_mutex -> memory_mutex -> stdout FILE lock. Callers release queue_mutex
- * before entering this module, so page events can be emitted in memory-access order. */
-void memory_record_reading(MemoryManager *memory, int sensor_id, double value)
+/* Lock order: queue_mutex -> memory_mutex -> event pipe. Callers release queue_mutex
+ * before entering; the logger consumes events without taking application locks. */
+void memory_record_reading(MemoryManager *memory, int sensor_id, double value,
+                           atomic_uint_fast64_t *heartbeat_ms,
+                           atomic_bool *fault_requested)
 {
     if (sensor_id < 0 || (size_t)sensor_id >= memory->sensor_count) return;
 
@@ -164,7 +179,8 @@ void memory_record_reading(MemoryManager *memory, int sensor_id, double value)
 
     pthread_mutex_lock(&memory->mutex);
     /* OS concept: a condition variable serializes page accesses for reproducible seeded runs. */
-    while (memory->next_sensor != (size_t)sensor_id && !*memory->shutdown_requested) {
+    while (memory->next_sensor != (size_t)sensor_id && !*memory->shutdown_requested &&
+           !atomic_load(fault_requested)) {
         struct timespec deadline;
         clock_gettime(CLOCK_REALTIME, &deadline);
         deadline.tv_nsec += 100000000L;
@@ -172,9 +188,11 @@ void memory_record_reading(MemoryManager *memory, int sensor_id, double value)
             deadline.tv_sec++;
             deadline.tv_nsec -= 1000000000L;
         }
-        (void)pthread_cond_timedwait(&memory->turn_changed, &memory->mutex, &deadline);
+        int wait_result = pthread_cond_timedwait(&memory->turn_changed, &memory->mutex, &deadline);
+        if (wait_result == ETIMEDOUT && !atomic_load(fault_requested))
+            atomic_store(heartbeat_ms, (uint64_t)elapsed_ms(memory->start_time));
     }
-    if (*memory->shutdown_requested) {
+    if (*memory->shutdown_requested || atomic_load(fault_requested)) {
         pthread_mutex_unlock(&memory->mutex);
         return;
     }
@@ -219,9 +237,8 @@ void memory_record_reading(MemoryManager *memory, int sensor_id, double value)
     memory->last_used[target] = ++memory->lru_clock;
     for (size_t i = 0; i < memory->frame_count; i++) frame_snapshot[i] = memory->frames[i];
     timestamp = elapsed_ms(memory->start_time);
-    printf("{\"t\":%lld,\"ev\":\"page_access\",\"sensor\":%d,\"page\":%" PRIu64 ",\"status\":\"%s\"}\n",
-           timestamp, sensor_id, page, is_fault ? "fault" : "hit");
-    fflush(stdout);
+    event_log_emit("{\"t\":%lld,\"ev\":\"page_access\",\"sensor\":%d,\"page\":%" PRIu64 ",\"status\":\"%s\"}",
+                   timestamp, sensor_id, page, is_fault ? "fault" : "hit");
     if (is_fault)
         emit_page_fault(timestamp, sensor_id, page, memory->algorithm,
                         frame_snapshot, memory->frame_count, victim);
@@ -321,9 +338,8 @@ void *memory_stats_thread(void *argument)
         uint64_t faults = context->memory->faults;
         pthread_mutex_unlock(&context->memory->mutex);
         double hit_ratio = accesses == 0 ? 0.0 : (double)(accesses - faults) / (double)accesses;
-        printf("{\"t\":%lld,\"ev\":\"mem_stats\",\"accesses\":%" PRIu64 ",\"faults\":%" PRIu64 ",\"hit_ratio\":%.3f}\n",
-               elapsed_ms(context->memory->start_time), accesses, faults, hit_ratio);
-        fflush(stdout);
+        event_log_emit("{\"t\":%lld,\"ev\":\"mem_stats\",\"accesses\":%" PRIu64 ",\"faults\":%" PRIu64 ",\"hit_ratio\":%.3f}",
+                       elapsed_ms(context->memory->start_time), accesses, faults, hit_ratio);
     }
     return NULL;
 }

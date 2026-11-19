@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "scheduler.h"
+#include "event_log.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -48,10 +49,9 @@ static void update_aging(Alert *ready, size_t count, long long now,
             new_level = MAX_EFFECTIVE_SEVERITY - alert->severity;
         while (alert->age_level < new_level) {
             alert->age_level++;
-            printf("{\"t\":%lld,\"ev\":\"aged\",\"id\":%" PRIu64 ",\"sensor\":%d,\"severity\":%d,\"age_boost\":%d}\n",
-                   elapsed_ms(start_time), alert->id, alert->sensor_id,
-                   alert->severity + alert->age_level, alert->age_level);
-            fflush(stdout);
+            event_log_emit("{\"t\":%lld,\"ev\":\"aged\",\"id\":%" PRIu64 ",\"sensor\":%d,\"severity\":%d,\"age_boost\":%d}",
+                           elapsed_ms(start_time), alert->id, alert->sensor_id,
+                           alert->severity + alert->age_level, alert->age_level);
         }
     }
 }
@@ -97,9 +97,8 @@ static void emit_schedule_event(const char *event, const Alert *alert,
                                 SchedulerAlgorithm algorithm,
                                 const struct timespec *start_time)
 {
-    printf("{\"t\":%lld,\"ev\":\"%s\",\"id\":%" PRIu64 ",\"algo\":\"%s\"}\n",
-           elapsed_ms(start_time), event, alert->id, scheduler_algorithm_name(algorithm));
-    fflush(stdout);
+    event_log_emit("{\"t\":%lld,\"ev\":\"%s\",\"id\":%" PRIu64 ",\"algo\":\"%s\"}",
+                   elapsed_ms(start_time), event, alert->id, scheduler_algorithm_name(algorithm));
 }
 
 static void sleep_ms(int milliseconds)
@@ -130,10 +129,9 @@ static void drain_queue(SchedulerContext *context, Alert *ready, size_t *ready_c
 
 static void complete_alert(SchedulerContext *context, const Alert *alert)
 {
-    printf("{\"t\":%lld,\"ev\":\"alert_dispatched\",\"id\":%" PRIu64 ",\"sensor\":%d,\"type\":\"%s\",\"severity\":%d}\n",
-           elapsed_ms(context->start_time), alert->id, alert->sensor_id,
-           alert->type, alert->severity);
-    fflush(stdout);
+    event_log_emit("{\"t\":%lld,\"ev\":\"alert_dispatched\",\"id\":%" PRIu64 ",\"sensor\":%d,\"type\":\"%s\",\"severity\":%d}",
+                   elapsed_ms(context->start_time), alert->id, alert->sensor_id,
+                   alert->type, alert->severity);
     sem_post(context->empty_slots);
 }
 
