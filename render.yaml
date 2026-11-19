@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: sentinel-disaster-warning-bridge
+    env: node
+    plan: free
+    buildCommand: "cd bridge && npm install"
+    startCommand: "node bridge/server.js"
+    healthCheckPath: /health
+    autoDeploy: true
