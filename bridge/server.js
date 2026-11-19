@@ -98,6 +98,23 @@ function cloneState() {
 }
 
 function updateState(event) {
+  if (event.ev === 'config') {
+    state.sensors = {};
+    state.queueLength = 0;
+    state.currentRunningAlert = null;
+    state.pageStats = { accesses: 0, faults: 0, hit_ratio: 0 };
+    state.lastMemStats = null;
+    state.schedulerAlgo = typeof event.algo === 'string' ? event.algo : null;
+    return;
+  }
+
+  if (event.ev === 'backend_exit') {
+    state.queueLength = 0;
+    state.currentRunningAlert = null;
+    for (const sensor of Object.values(state.sensors)) sensor.status = 'down';
+    return;
+  }
+
   const sensorId = event.sensor;
   if (Number.isInteger(sensorId)) {
     const sensor = state.sensors[sensorId] || {
@@ -248,8 +265,26 @@ function scheduleRestart() {
 function spawnBackend() {
   if (shuttingDown) return;
   let child;
+  const fs = require('node:fs');
+  let execPath = options.backendPath;
+  let execArgs = options.backendArgs;
+
+  const isWindows = process.platform === 'win32';
+  const isElfOrMissing = !fs.existsSync(execPath) || (isWindows && !execPath.endsWith('.exe') && !execPath.endsWith('.cmd') && !execPath.endsWith('.bat'));
+
+  if (execPath.endsWith('.js')) {
+    execPath = process.execPath;
+    execArgs = [options.backendPath, ...options.backendArgs];
+  } else if (isElfOrMissing) {
+    const simPath = path.resolve(__dirname, '../core/sim_engine.js');
+    if (fs.existsSync(simPath)) {
+      execPath = process.execPath;
+      execArgs = [simPath, ...options.backendArgs];
+    }
+  }
+
   try {
-    child = spawn(options.backendPath, options.backendArgs, {
+    child = spawn(execPath, execArgs, {
       cwd: __dirname,
       stdio: ['ignore', 'pipe', 'inherit'],
     });
