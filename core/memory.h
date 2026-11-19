@@ -8,6 +8,7 @@
 #include <time.h>
 
 #define MEMORY_MAX_FRAMES 4096
+#define MEMORY_TRACE_LENGTH 2000U
 
 typedef enum {
     PAGE_FIFO,
@@ -25,15 +26,20 @@ typedef struct {
     ReadingRing *sensor_rings;
     size_t sensor_count;
     size_t buffer_size;
+    size_t page_size;
     size_t frame_count;
     uint64_t *frames;
     uint64_t *last_used;
+    uint32_t *page_seeds;
+    size_t next_sensor;
     size_t fifo_next;
     uint64_t lru_clock;
     uint64_t accesses;
     uint64_t faults;
     PageAlgorithm algorithm;
     pthread_mutex_t mutex;
+    pthread_cond_t turn_changed;
+    volatile sig_atomic_t *shutdown_requested;
     const struct timespec *start_time;
 } MemoryManager;
 
@@ -43,10 +49,13 @@ typedef struct {
 } MemoryStatsContext;
 
 int memory_init(MemoryManager *memory, size_t sensor_count, size_t buffer_size,
-                size_t frame_count, PageAlgorithm algorithm,
+                size_t page_size, size_t frame_count, PageAlgorithm algorithm,
+                uint32_t seed, volatile sig_atomic_t *shutdown_requested,
                 const struct timespec *start_time);
 void memory_destroy(MemoryManager *memory);
 void memory_record_reading(MemoryManager *memory, int sensor_id, double value);
+void memory_run_page_comparison(size_t sensor_count, size_t buffer_size,
+                                size_t page_size, size_t frame_count, uint32_t seed);
 void *memory_stats_thread(void *argument);
 
 #endif

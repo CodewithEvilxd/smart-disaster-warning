@@ -1,8 +1,8 @@
 /*
  * Lock order: queue_mutex -> memory_mutex -> log_mutex if locks are nested.
  * Current paths never nest these locks: queue operations release queue_mutex
- * before memory access, memory events release memory_mutex before stdout, and
- * stdout's FILE lock is not held while acquiring either application mutex.
+ * before memory access; page events take stdout's FILE lock only while holding
+ * memory_mutex, and no output path takes an application mutex while holding stdout.
  * This keeps the order consistent and prevents a circular-wait deadlock.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -12,6 +12,7 @@
 #include "memory.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -47,6 +48,16 @@ static int parse_positive(const char *text, int maximum, int *result)
     return 0;
 }
 
+static int parse_seed(const char *text, uint32_t *seed)
+{
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value > UINT32_MAX) return -1;
+    *seed = (uint32_t)value;
+    return 0;
+}
+
 static int parse_algorithm(const char *name, SchedulerAlgorithm *algorithm)
 {
     if (strcmp(name, "priority") == 0) *algorithm = SCHED_PRIORITY;
@@ -66,16 +77,26 @@ static int parse_page_algorithm(const char *name, PageAlgorithm *algorithm)
 
 static int parse_options(int argc, char **argv, int *sensors, int *queue_size,
                          SchedulerAlgorithm *algorithm, int *quantum_ms,
-                         int *buffer_size, int *frame_count, PageAlgorithm *page_algorithm)
+                         int *buffer_size, int *page_size, int *frame_count,
+                         PageAlgorithm *page_algorithm, uint32_t *seed,
+                         int *page_trace_only)
 {
     *sensors = 4;
     *queue_size = 16;
     *algorithm = SCHED_PRIORITY;
     *quantum_ms = 100;
     *buffer_size = 16;
-    *frame_count = 4;
+    *frame_count = 8;
     *page_algorithm = PAGE_FIFO;
+    *page_size = 4;
+    *seed = (uint32_t)time(NULL);
+    if (*seed == 0) *seed = 1;
+    *page_trace_only = 0;
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--page-trace-only") == 0) {
+            *page_trace_only = 1;
+            continue;
+        }
         if (i + 1 >= argc) return -1;
         int *destination = NULL;
         int maximum = 0;
@@ -91,6 +112,9 @@ static int parse_options(int argc, char **argv, int *sensors, int *queue_size,
         } else if (strcmp(argv[i], "--buffer-size") == 0) {
             destination = buffer_size;
             maximum = 65536;
+        } else if (strcmp(argv[i], "--page-size") == 0) {
+            destination = page_size;
+            maximum = 65536;
         } else if (strcmp(argv[i], "--frames") == 0) {
             destination = frame_count;
             maximum = MEMORY_MAX_FRAMES;
@@ -99,6 +123,9 @@ static int parse_options(int argc, char **argv, int *sensors, int *queue_size,
             continue;
         } else if (strcmp(argv[i], "--page-algo") == 0) {
             if (parse_page_algorithm(argv[++i], page_algorithm) == -1) return -1;
+            continue;
+        } else if (strcmp(argv[i], "--seed") == 0) {
+            if (parse_seed(argv[++i], seed) == -1) return -1;
             continue;
         } else {
             return -1;
@@ -114,13 +141,27 @@ int main(int argc, char **argv)
     int queue_capacity;
     int quantum_ms;
     int buffer_size;
+    int page_size;
     int frame_count;
+    int page_trace_only;
+    uint32_t seed;
     SchedulerAlgorithm algorithm;
     PageAlgorithm page_algorithm;
     if (parse_options(argc, argv, &sensor_count, &queue_capacity, &algorithm, &quantum_ms,
-                      &buffer_size, &frame_count, &page_algorithm) == -1) {
-        fprintf(stderr, "Usage: %s [--sensors N] [--queue-size N] [--algo priority|rr|sjf] [--quantum MS] [--buffer-size N] [--frames N] [--page-algo fifo|lru]\n", argv[0]);
+                      &buffer_size, &page_size, &frame_count, &page_algorithm,
+                      &seed, &page_trace_only) == -1 || page_size > buffer_size) {
+        fprintf(stderr, "Usage: %s [--sensors N] [--queue-size N] [--algo priority|rr|sjf] [--quantum MS] [--buffer-size N] [--page-size N] [--frames N] [--page-algo fifo|lru] [--seed N] [--page-trace-only]\n", argv[0]);
         return EXIT_FAILURE;
+    }
+
+    printf("{\"t\":0,\"ev\":\"config\",\"seed\":%" PRIu32 ",\"sensors\":%d,\"queue_size\":%d,\"buffer_size\":%d,\"page_size\":%d,\"frames\":%d,\"page_algo\":\"%s\",\"page_trace_only\":%s}\n",
+           seed, sensor_count, queue_capacity, buffer_size, page_size, frame_count,
+           page_algorithm == PAGE_LRU ? "lru" : "fifo", page_trace_only ? "true" : "false");
+    fflush(stdout);
+    if (page_trace_only) {
+        memory_run_page_comparison((size_t)sensor_count, (size_t)buffer_size,
+                                   (size_t)page_size, (size_t)frame_count, seed);
+        return EXIT_SUCCESS;
     }
 
     PriorityQueue queue;
@@ -145,7 +186,8 @@ int main(int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &program_start);
     MemoryManager memory;
     if (memory_init(&memory, (size_t)sensor_count, (size_t)buffer_size,
-                    (size_t)frame_count, page_algorithm, &program_start) == -1) {
+                    (size_t)page_size, (size_t)frame_count, page_algorithm,
+                    seed, &shutdown_requested, &program_start) == -1) {
         fprintf(stderr, "Failed to initialize memory module\n");
         sem_destroy(&full_slots);
         sem_destroy(&empty_slots);
@@ -227,7 +269,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < sensor_count; i++) {
         contexts[i] = (SensorContext){
             .sensor_id = i,
-            .seed = (unsigned int)time(NULL) ^ ((unsigned int)i * 2654435761U),
+            .seed = seed ^ ((unsigned int)(i + 1) * 0x9e3779b9U),
             .queue = &queue,
             .empty_slots = &empty_slots,
             .full_slots = &full_slots,

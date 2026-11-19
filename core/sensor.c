@@ -44,6 +44,7 @@ void *sensor_thread(void *argument)
 {
     SensorContext *context = argument;
     const int type_index = context->sensor_id % 4;
+    context->seed = context->seed == 0 ? 0x6d2b79f5U : context->seed;
     while (!*context->shutdown_requested) {
         const double value = (double)(next_random(&context->seed) % 10001U) / 100.0;
         printf("{\"t\":%lld,\"ev\":\"reading\",\"sensor\":%d,\"type\":\"%s\",\"value\":%.2f}\n",
