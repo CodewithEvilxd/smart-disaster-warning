@@ -209,8 +209,15 @@ function snapshotMessage() {
 }
 
 const server = http.createServer((request, response) => {
+  if (request.url === '/favicon.ico') {
+    response.writeHead(204);
+    response.end();
+    return;
+  }
+
   if (request.method === 'GET' && request.url === '/health') {
     const body = JSON.stringify({
+      status: 'healthy',
       backendRunning,
       clients: webSockets.clients.size,
       eventsSeen,
@@ -226,6 +233,30 @@ const server = http.createServer((request, response) => {
     response.end(body);
     return;
   }
+
+  if (request.method === 'GET' && (request.url === '/' || request.url === '/status')) {
+    const host = request.headers.host || `localhost:${options.port}`;
+    const body = JSON.stringify({
+      service: 'Sentinel Smart Disaster Warning OS — WebSocket Bridge',
+      status: 'online',
+      protocol: 'WebSocket (RFC 6455)',
+      websocket_endpoint: `wss://${host}`,
+      health_check: `https://${host}/health`,
+      backend_running: backendRunning,
+      clients_connected: webSockets.clients.size,
+      events_processed: eventsSeen,
+      uptime_seconds: Math.floor(process.uptime()),
+      message: 'Connect a WebSocket client or Next.js dashboard to this endpoint.',
+    }, null, 2);
+    response.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(body),
+      'cache-control': 'no-store',
+    });
+    response.end(body);
+    return;
+  }
+
   response.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
   response.end('{"error":"not found"}');
 });
