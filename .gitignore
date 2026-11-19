@@ -1,2 +1,4 @@
 *.txt
 logs/
+bridge/node_modules/
+bridge/.runtime-node/
